@@ -282,3 +282,10 @@ class Trader:
             pass
 
         return result, 0, td
+    
+if __name__ == "__main__":
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from prosperity4bt.__main__ import main
+    sys.argv = ["prosperity4bt", __file__, "1", "--data", "DATA", "--no-progress"]
+    main()

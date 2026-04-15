@@ -9,7 +9,7 @@ import numpy as np
 
 # ── paths ────────────────────────────────────────────────────────────────────
 BASE   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA   = os.path.join(BASE, "DATA_ROUND1")
+DATA   = os.path.join(BASE, "DATA/round1")
 OUT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "round1")
 os.makedirs(OUT, exist_ok=True)
 
