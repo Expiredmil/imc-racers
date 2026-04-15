@@ -16,6 +16,13 @@ POS_LIMITS = {
 # PEPPER trend parameters (from data analysis: ~+1000 drift per day over 1M ts)
 PEPPER_DAILY_DRIFT = 1000
 PEPPER_MAX_TIMESTAMP = 1_000_000
+PEPPER_SKEW_COEF = 0.05          # fair-value push per unit of inventory
+PEPPER_HEAVY_POS = 30            # |pos| above this → symmetric thresholds
+PEPPER_BUY_EDGE = 0              # take buys when ap < fair - BUY_EDGE
+PEPPER_SELL_EDGE = 2             # take sells when bp > fair + SELL_EDGE
+PEPPER_OPEN_SAMPLES = 20         # #3 update day_open over first N ticks, then freeze
+PEPPER_VERY_HEAVY_POS = 35       # #4 |pos| above this → widen quotes
+PEPPER_HEAVY_WIDEN = 2           # #4 tick count to back off quote on heavy side
 
 # OSMIUM EMA parameter (window=40 corresponds to alpha ≈ 0.05)
 OSMIUM_EMA_WINDOW = 40
@@ -193,17 +200,23 @@ class PepperTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
         super().__init__(PEPPER, state, prints, new_trader_data)
 
-        # Capture day_open at timestamp 0, persist across ticks within the day
+        # #3 Robust day_open: Welford-style running mean over first N ticks,
+        # declining weight (sample k contributes 1/k), then frozen.
+        n = self.last_traderData.get("pep_open_n", 0)
         stored_open = self.last_traderData.get("pep_day_open")
-        if self.state.timestamp == 0 and self.wall_mid is not None:
-            self.day_open = self.wall_mid
-        elif stored_open is not None:
-            self.day_open = stored_open
-        else:
-            self.day_open = self.wall_mid  # fallback for mid-day starts
 
-        if self.day_open is not None:
+        if n >= PEPPER_OPEN_SAMPLES:
+            self.day_open = stored_open
+        elif self.wall_mid is not None:
+            n += 1
+            if stored_open is None:
+                self.day_open = self.wall_mid
+            else:
+                self.day_open = stored_open + (self.wall_mid - stored_open) / n
             self.new_trader_data["pep_day_open"] = self.day_open
+            self.new_trader_data["pep_open_n"] = n
+        else:
+            self.day_open = stored_open
 
         # Fair value = day_open + linear drift
         if self.day_open is not None:
@@ -220,24 +233,32 @@ class PepperTrader(ProductTrader):
         if self.fair_value is None or self.bid_wall is None or self.ask_wall is None:
             return {self.name: self.orders}
 
-        fair = self.fair_value
+        skew = -PEPPER_SKEW_COEF * self.initial_position
+        fair = self.fair_value + skew
+        self.log("fair_skewed", fair)
+        self.log("skew", skew)
 
-        # ── 1) TAKING: aggressively buy anything meaningfully below fair,
-        #              sell only when well above fair (long bias)
+        sell_threshold = fair + PEPPER_SELL_EDGE if self.initial_position < PEPPER_HEAVY_POS else fair
+        buy_threshold = fair - PEPPER_BUY_EDGE if self.initial_position > -PEPPER_HEAVY_POS else fair
+
         for ap, av in self.mkt_sell_orders.items():
-            if ap < fair - 1:
+            if ap < buy_threshold:
                 self.bid(ap, av)
 
         for bp, bv in self.mkt_buy_orders.items():
-            if bp > fair + 2:   # wider threshold on sell side to keep long
+            if bp > sell_threshold:
                 self.ask(bp, bv)
 
-        # ── 2) MAKING: long-biased quotes
         bid_price = int(self.bid_wall) + 1
         ask_price = int(self.ask_wall) - 1
 
         bid_price = min(bid_price, int(fair) - 1)
         ask_price = max(ask_price, int(fair) + 2)
+
+        if self.initial_position > PEPPER_VERY_HEAVY_POS:
+            bid_price -= PEPPER_HEAVY_WIDEN
+        elif self.initial_position < -PEPPER_VERY_HEAVY_POS:
+            ask_price += PEPPER_HEAVY_WIDEN
 
         self.bid(bid_price, self.max_allowed_buy_volume)
         self.ask(ask_price, self.max_allowed_sell_volume)
@@ -287,5 +308,12 @@ if __name__ == "__main__":
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from prosperity4bt.__main__ import main
-    sys.argv = ["prosperity4bt", __file__, "1", "--data", "DATA", "--no-progress"]
+    sys.argv = [
+        "prosperity4bt", __file__, "1",
+        "--data", "DATA",
+        "--no-progress",
+        "--merge-pnl",
+    ]
     main()
+
+#without logs sys.argv = ["prosperity4bt", __file__, "1", "--data", "DATA", "--no-out", "--no-progress"]
