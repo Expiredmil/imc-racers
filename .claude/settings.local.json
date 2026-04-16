@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python STRATEGY/round1.py)"
+    ]
+  }
+}

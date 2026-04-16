@@ -96,6 +96,7 @@ def has_day_data(file_reader: FileReader, round_num: int, day_num: int) -> bool:
 
 def read_day_data(file_reader: FileReader, round_num: int, day_num: int, no_names: bool) -> BacktestData:
     prices = []
+    last_mid: dict[str, float] = {}
     with file_reader.file([f"round{round_num}", f"prices_round_{round_num}_day_{day_num}.csv"]) as file:
         if file is None:
             raise ValueError(f"Prices data is not available for round {round_num} day {day_num}")
@@ -103,16 +104,23 @@ def read_day_data(file_reader: FileReader, round_num: int, day_num: int, no_name
         for line in file.read_text(encoding="utf-8").splitlines()[1:]:
             columns = line.split(";")
 
+            product = columns[2]
+            mid_price = float(columns[15])
+            if mid_price == 0.0 and product in last_mid:
+                mid_price = last_mid[product]
+            else:
+                last_mid[product] = mid_price
+
             prices.append(
                 PriceRow(
                     day=int(columns[0]),
                     timestamp=int(columns[1]),
-                    product=columns[2],
+                    product=product,
                     bid_prices=get_column_values(columns, [3, 5, 7]),
                     bid_volumes=get_column_values(columns, [4, 6, 8]),
                     ask_prices=get_column_values(columns, [9, 11, 13]),
                     ask_volumes=get_column_values(columns, [10, 12, 14]),
-                    mid_price=float(columns[15]),
+                    mid_price=mid_price,
                     profit_loss=float(columns[16]),
                 )
             )

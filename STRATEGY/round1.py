@@ -1,4 +1,5 @@
 from datamodel import OrderDepth, TradingState, Order
+from logger import logger
 import json
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -20,12 +21,15 @@ PEPPER_SKEW_COEF = 0.05          # fair-value push per unit of inventory
 PEPPER_HEAVY_POS = 30            # |pos| above this → symmetric thresholds
 PEPPER_BUY_EDGE = 0              # take buys when ap < fair - BUY_EDGE
 PEPPER_SELL_EDGE = 2             # take sells when bp > fair + SELL_EDGE
-PEPPER_OPEN_SAMPLES = 20         # #3 update day_open over first N ticks, then freeze
-PEPPER_VERY_HEAVY_POS = 35       # #4 |pos| above this → widen quotes
-PEPPER_HEAVY_WIDEN = 2           # #4 tick count to back off quote on heavy side
+PEPPER_OPEN_SAMPLES = 20         # update day_open over first N ticks, then freeze
+PEPPER_VERY_HEAVY_POS = 35       # |pos| above this → widen quotes
+PEPPER_HEAVY_WIDEN = 2           # tick count to back off quote on heavy side
 
-# OSMIUM EMA parameter (window=40 corresponds to alpha ≈ 0.05)
+# OSMIUM parameters
 OSMIUM_EMA_WINDOW = 40
+OSMIUM_SKEW_COEF = 0.05          # fair-value push per unit of inventory
+OSMIUM_OFI_COEF = -0.05          # negative = fade momentum (mean-reversion)
+OSMIUM_OFI_EMA = 10              # EMA window for OFI smoothing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,24 +136,73 @@ class OsmiumTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
         super().__init__(OSMIUM, state, prints, new_trader_data)
 
-        # Two mid methods computed every tick so we can compare
-        self.simple_wall_mid = self.wall_mid  # (bid_wall + ask_wall) / 2 — prior-year approach
-
         vwm = self.vw_mid()
         if vwm is not None:
             self.vw_ema_mid = self.calculate_ema("osm_vw_ema", OSMIUM_EMA_WINDOW, vwm)
         else:
             self.vw_ema_mid = self.last_traderData.get("osm_vw_ema", None)
 
-        # Log both for later comparison
-        self.log("simple_wall_mid", self.simple_wall_mid)
+        # OFI: Order Flow Imbalance (Cont, Kukanov & Stoikov 2014)
+        self.ofi = self._compute_ofi()
+        if self.ofi is not None:
+            self.ofi_ema = self.calculate_ema("osm_ofi_ema", OSMIUM_OFI_EMA, self.ofi)
+        else:
+            self.ofi_ema = self.last_traderData.get("osm_ofi_ema", 0)
+
+        # Store current best bid/ask for next tick's OFI
+        if self.best_bid is not None:
+            self.new_trader_data["osm_prev_bb"] = self.best_bid
+            self.new_trader_data["osm_prev_bv"] = self.mkt_buy_orders.get(self.best_bid, 0)
+        if self.best_ask is not None:
+            self.new_trader_data["osm_prev_ap"] = self.best_ask
+            self.new_trader_data["osm_prev_av"] = self.mkt_sell_orders.get(self.best_ask, 0)
+
         self.log("vw_ema_mid", self.vw_ema_mid)
+        self.log("ofi", self.ofi)
+        self.log("ofi_ema", self.ofi_ema)
         self.log("position", self.initial_position)
 
+    def _compute_ofi(self):
+        """Order Flow Imbalance: tracks changes in best bid/ask volume to detect pressure."""
+        prev_bb = self.last_traderData.get("osm_prev_bb")
+        prev_bv = self.last_traderData.get("osm_prev_bv")
+        prev_ap = self.last_traderData.get("osm_prev_ap")
+        prev_av = self.last_traderData.get("osm_prev_av")
+
+        if any(v is None for v in [prev_bb, prev_bv, prev_ap, prev_av]):
+            return None
+        if self.best_bid is None or self.best_ask is None:
+            return None
+
+        curr_bv = self.mkt_buy_orders.get(self.best_bid, 0)
+        curr_av = self.mkt_sell_orders.get(self.best_ask, 0)
+
+        # Bid side: price up → new demand, same → volume change, down → demand withdrew
+        if self.best_bid > prev_bb:
+            bid_ofi = curr_bv
+        elif self.best_bid == prev_bb:
+            bid_ofi = curr_bv - prev_bv
+        else:
+            bid_ofi = -prev_bv
+
+        # Ask side: price down → new supply, same → volume change, up → supply withdrew
+        if self.best_ask < prev_ap:
+            ask_ofi = -curr_av
+        elif self.best_ask == prev_ap:
+            ask_ofi = -(curr_av - prev_av)
+        else:
+            ask_ofi = prev_av
+
+        return bid_ofi + ask_ofi
+
     def get_orders(self):
-        fair = self.vw_ema_mid  # PRIMARY fair value
-        if fair is None or self.bid_wall is None or self.ask_wall is None:
+        if self.vw_ema_mid is None or self.bid_wall is None or self.ask_wall is None:
             return {self.name: self.orders}
+
+        skew = -OSMIUM_SKEW_COEF * self.initial_position
+        ofi_adj = OSMIUM_OFI_COEF * self.ofi_ema
+        fair = self.vw_ema_mid + skew + ofi_adj
+        self.log("fair_skewed", fair)
 
         # ── 1) TAKING: aggressively hit mispriced quotes
         for ap, av in self.mkt_sell_orders.items():
@@ -200,8 +253,7 @@ class PepperTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
         super().__init__(PEPPER, state, prints, new_trader_data)
 
-        # #3 Robust day_open: Welford-style running mean over first N ticks,
-        # declining weight (sample k contributes 1/k), then frozen.
+        # Robust day_open: Welford-style running mean over first N ticks, then frozen.
         n = self.last_traderData.get("pep_open_n", 0)
         stored_open = self.last_traderData.get("pep_day_open")
 
@@ -297,23 +349,30 @@ class Trader:
         except Exception:
             td = ""
 
-        try:
-            print(json.dumps(prints))
-        except Exception:
-            pass
+        logger.print(json.dumps(prints))
+        logger.flush(state, result, 0, td)
 
         return result, 0, td
     
 if __name__ == "__main__":
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from datetime import datetime
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, root)
+    os.chdir(root)
     from prosperity4bt.__main__ import main
-    sys.argv = [
-        "prosperity4bt", __file__, "1",
-        "--data", "DATA",
-        "--no-progress",
-        "--merge-pnl",
-    ]
-    main()
-
-#without logs sys.argv = ["prosperity4bt", __file__, "1", "--data", "DATA", "--no-out", "--no-progress"]
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    round_num = 1
+    for day in ["-2", "-1", "0"]:
+        out_dir = f"BACKTESTS/round{round_num}/day{day}"
+        os.makedirs(out_dir, exist_ok=True)
+        sys.argv = [
+            "prosperity4bt", __file__, f"{round_num}-{day}",
+            "--data", "DATA",
+            "--no-progress",
+            "--out", f"{out_dir}/{ts}.log",
+        ]
+        try:
+            main()
+        except SystemExit:
+            pass
